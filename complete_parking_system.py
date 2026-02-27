@@ -5,6 +5,8 @@ import subprocess
 import json
 import numpy as np
 from pathlib import Path
+from shapely.geometry import Polygon, box
+
 
 # ============================================
 # PACKAGE INSTALLATION CHECK
@@ -46,6 +48,8 @@ check_and_install_packages()
 
 # Now import
 from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
 
 # ============================================
 # CONFIGURATION - EDIT THESE PATHS IF NEEDED
@@ -269,7 +273,12 @@ def run_detection():
     # Load YOLO model
     print("\nLoading YOLO model...")
     try:
-        model = YOLO('yolo11n.pt')
+        model = YOLO('yolo11s.pt')
+        tracker = DeepSort(
+            max_age=50,          # keep tracks longer
+            n_init=2,            # confirm faster (default 3)
+            max_iou_distance=0.9
+        )
         print("OK: Model loaded successfully")
     except Exception as e:
         print(f"ERROR: Error loading model: {e}")
@@ -323,53 +332,81 @@ def run_detection():
         if not ret:
             break
         
-        # Detect cars in frame
-        results = model(frame, conf=0.4, verbose=False)
-        
-        # Get car center points
-        car_centers = []
+        # Detect cars using YOLO
+        results = model(frame, conf=0.3, verbose=False)
+
+        detections = []
+
         if results[0].boxes is not None:
-            for box in results[0].boxes:
-                if int(box.cls[0]) == 2:  # Class 2 is 'car' in COCO dataset
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                    car_centers.append(center)
-                    
-                    # Draw car bounding box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+            for det in results[0].boxes:
+                if int(det.cls[0]) in [2, 5, 7]:
+                    x1, y1, x2, y2 = map(int, det.xyxy[0])
+                    w = x2 - x1
+                    h = y2 - y1
+                    detections.append(([x1, y1, w, h],
+                                       float(det.conf[0]),
+                                       'car'))
+
+        # Update DeepSORT tracker
+        tracks = tracker.update_tracks(detections, frame=frame)
+        car_centers = []
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+            track_id = track.track_id
+            l, t, r, b = map(int, track.to_ltrb())
+            center = ((l + r) // 2, (t + b) // 2)
+            car_centers.append(center)
+
+            # Draw tracked bounding box
+            cv2.rectangle(frame, (l, t), (r, b), (255, 255, 0), 2)
+            cv2.putText(frame,
+                        f"ID:{track_id}",
+                        (l, t - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 0),
+                        2)
+
         
-        # Check each parking slot
+        # Check each parking slot using intersection area
         free_count = 0
         occupied_count = 0
-        
         for i, slot in enumerate(slots):
-            points = np.array(slot['points'], np.int32)
-            
-            # Check if any car center is inside this slot
+            slot_polygon = Polygon(slot['points'])
+            slot_area = slot_polygon.area
             is_occupied = False
-            for center in car_centers:
-                if point_in_polygon(center, slot['points']):
+            
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+
+                l, t, r, b = map(int, track.to_ltrb())
+                vehicle_box = box(l, t, r, b)
+
+                intersection_area = slot_polygon.intersection(vehicle_box).area
+
+        # 🔥 THIS IS THE IMPORTANT LINE
+                if intersection_area / slot_area > 0.30:
                     is_occupied = True
                     break
-            
-            # Set color based on occupancy
+            points = np.array(slot['points'], np.int32)
+
             if is_occupied:
-                color = (0, 0, 255)  # Red for occupied
+                color = (0, 0, 255)  # Red
                 status = "OCC"
                 occupied_count += 1
             else:
-                color = (0, 255, 0)  # Green for free
+                color = (0, 255, 0)  # Green
                 status = "FREE"
                 free_count += 1
-            
-            # Draw parking slot
             cv2.polylines(frame, [points], True, color, 3)
-            
-            # Add slot label
+
             cx = sum(p[0] for p in slot['points']) // 4
             cy = sum(p[1] for p in slot['points']) // 4
-            cv2.putText(frame, f"{i}:{status}", (cx-30, cy), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(frame, f"{i}:{status}", (cx-30, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
         
         # Display statistics
         stats = f"FREE: {free_count}  OCCUPIED: {occupied_count}  TOTAL: {len(slots)}"
